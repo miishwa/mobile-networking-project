@@ -19,6 +19,7 @@ main{max-width:1240px;margin:0 auto;padding:16px}
 #alert.bad{background:#3a1217;border-left-color:var(--dead)}
 .locs{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-bottom:12px}
 .loc{font:inherit;color:inherit;text-align:left;background:var(--panel);border:1px solid var(--line);border-top:4px solid var(--c);border-radius:10px;padding:10px 14px;cursor:pointer;display:flex;flex-direction:column;gap:2px}
+.loc.idle{opacity:.6}
 .loc.sel{outline:2px solid var(--link);outline-offset:1px}
 .loc:focus-visible{outline:2px solid var(--link)}
 .r1{display:flex;justify-content:space-between;align-items:center;gap:8px}
@@ -53,7 +54,7 @@ main{max-width:1240px;margin:0 auto;padding:16px}
   <div class="meta"><span id="pill" class="pill none">Starting</span><span id="upd"></span></div>
 </header>
 <main>
-  <div id="alert" role="status" aria-live="polite">Checking sensors</div>
+  <div id="alert" role="status" aria-live="polite">Waiting for the first reading</div>
   <section class="locs" id="locs" aria-label="Locations"></section>
 
   <div class="head"><h2 id="selName"></h2><div id="selSub"></div></div>
@@ -76,78 +77,64 @@ main{max-width:1240px;margin:0 auto;padding:16px}
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script>
-/* Location 0 is LIVE (read from the Flask backend, fed by the Raspberry Pi). Locations 1-3 are MOCK.
-   REAL_LOCATION must match the LOCATION used by sensor.py. If you open this file directly instead of
-   via Flask, set API_BASE to the backend address (e.g. 'http://192.168.1.50:5000'). */
+/* Data comes from backend/app.py (the shared contract):
+     GET /api/status                 -> [{location, avg_rssi, latency_ms, packet_loss_pct, status}]
+     GET /api/readings?location=X    -> [{id, location, rssi, latency_ms, packet_loss_pct, timestamp}] (oldest first)
+   Locations are discovered automatically, so whatever pi/sensor.py and pi/fakepis.py send shows up.
+   Locations whose name starts with LIVE_PREFIX are tagged "live" (the real Pi); the rest are "simulated".
+   Open this file directly or from any web server: it finds the backend on port 5000 of the same machine.
+   To point elsewhere, add ?api=http://192.168.x.x:5000 to the page address. */
+const qApi = new URLSearchParams(location.search).get('api');
 const CONFIG = {
-  API_BASE: location.protocol === 'file:' ? 'http://localhost:5000' : '',
-  REAL_LOCATION: 'Pi Sensor', REFRESH_MS: 5000, POINTS: 60, STALE_S: 30
+  API_BASE: qApi ? qApi.replace(/\/$/, '')
+    : location.protocol === 'file:' ? 'http://localhost:5000'
+    : location.port === '5000' ? '' : 'http://' + location.hostname + ':5000',
+  LIVE_PREFIX: 'Real Pi', REFRESH_MS: 5000, STALE_S: 20
 };
-const WIN = Math.round(CONFIG.POINTS * CONFIG.REFRESH_MS / 60000) + ' min';
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const clock = d => new Date(d).toLocaleTimeString([], { hour12: false });
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-const quality = r => r == null ? 0 : clamp(2 * (r + 100), 0, 100);   // common linear dBm -> % mapping (-50 dBm = 100 %, -100 dBm = 0 %)
-const classify = r => r == null ? 'Dead Zone' : r > -67 ? 'Good' : r >= -80 ? 'Weak' : 'Dead Zone';
+const quality = r => r == null ? 0 : clamp(2 * (r + 100), 0, 100);   // linear dBm -> % (-50 dBm = 100 %, -100 dBm = 0 %)
 const cls = s => s === 'Good' ? 'good' : s === 'Weak' ? 'weak' : s === 'Dead Zone' ? 'dead' : 'none';
+const fmt = (v, d = 0) => v == null ? '--' : (+v).toFixed(d);
 
-const state = { sel: 0, locs: [
-  { name: CONFIG.REAL_LOCATION, kind: 'live', hist: [], note: 'Waiting for the Pi to send data' },
-  { name: 'Near Router', kind: 'mock', m: { base: -52, amp: 4, per: 3.5, ph: 0.0, lat: 6 },  hist: [] },
-  { name: 'Hallway',     kind: 'mock', m: { base: -73, amp: 8, per: 4.5, ph: 1.2, lat: 9 },  hist: [] },
-  { name: 'Stairwell',   kind: 'mock', m: { base: -86, amp: 8, per: 5.5, ph: 2.4, lat: 12 }, hist: [] }
-] };
+const state = { sel: null, locs: new Map(), err: false, loaded: false };
 
-/* ---------- mock data (same shape as /api/readings) ---------- */
-let tick = 0;
-function mockPoint(m, t, ts) {
-  const rssi = Math.round(m.base + m.amp * Math.sin(t / m.per + m.ph) + (Math.random() - .5) * 3);
-  const below = Math.max(0, -67 - rssi);
-  return { ts: new Date(ts).toISOString(), rssi,
-    latency_ms: Math.round(m.lat + below * below * 0.12 + Math.random() * 4),
-    packet_loss_pct: rssi > -67 ? +(Math.random() * 0.4).toFixed(1) : +Math.min(60, below + Math.random() * 2).toFixed(1) };
+/* ---------- data from the backend ---------- */
+async function getJSON(path) {
+  const r = await fetch(CONFIG.API_BASE + path);
+  if (!r.ok) throw new Error(path + ' ' + r.status);
+  return r.json();
 }
-const mocks = () => state.locs.filter(l => l.kind === 'mock');
-function seed() {
-  const now = Date.now();
-  mocks().forEach(l => { for (let i = 0; i < CONFIG.POINTS; i++) {
-    const back = CONFIG.POINTS - 1 - i; l.hist.push(mockPoint(l.m, -back, now - back * CONFIG.REFRESH_MS)); } });
-}
-function mockStep() {
-  tick++;
-  mocks().forEach(l => { l.hist.push(mockPoint(l.m, tick, Date.now())); if (l.hist.length > CONFIG.POINTS) l.hist.shift(); });
-}
-
-/* ---------- real data from the backend ---------- */
-async function pullReal(l) {
+async function pull() {
   try {
-    const sr = await fetch(CONFIG.API_BASE + '/api/status');
-    if (!sr.ok) throw new Error('status ' + sr.status);
-    const s = await sr.json();
-    if (!(s.locations || []).some(x => x.location === l.name)) {
-      l.hist = []; l.err = false; l.note = 'Waiting for the Pi to send its first reading'; return;
-    }
-    const rr = await fetch(`${CONFIG.API_BASE}/api/readings?location=${encodeURIComponent(l.name)}&limit=${CONFIG.POINTS}`);
-    if (!rr.ok) throw new Error('readings ' + rr.status);
-    l.hist = (await rr.json()).readings || []; l.err = false; l.note = '';
+    const status = await getJSON('/api/status');
+    const hists = await Promise.all(status.map(s =>
+      getJSON('/api/readings?location=' + encodeURIComponent(s.location)).catch(() => null)));
+    const now = Date.now();
+    status.forEach((s, i) => {
+      let l = state.locs.get(s.location);
+      if (!l) { l = { name: s.location, hist: [], lastId: null, lastChange: now }; state.locs.set(s.location, l); }
+      l.kind = s.location.startsWith(CONFIG.LIVE_PREFIX) ? 'live' : 'simulated';
+      l.st = s;
+      if (hists[i]) l.hist = hists[i];
+      /* "no new data" is judged by whether a new reading id has appeared, so the Pi's clock never matters */
+      const id = l.hist.length ? l.hist[l.hist.length - 1].id : null;
+      if (id !== l.lastId) { l.lastId = id; l.lastChange = now; }
+    });
+    state.err = false;
+    state.loaded = true;
+    if (!state.sel || !state.locs.has(state.sel)) state.sel = sorted()[0]?.name ?? null;
   } catch (e) {
-    l.err = true; l.note = 'Backend unreachable. Is app.py running?';
+    state.err = true;
   }
 }
-
-/* ---------- derived view of one location ---------- */
-function view(l) {
-  const c = l.hist.at(-1);
-  if (!c) return { empty: true, status: 'No data', cls: 'none', note: l.note };
-  const age = (Date.now() - Date.parse(c.ts)) / 1000;
-  const stale = l.kind === 'live' && age > CONFIG.STALE_S;
-  const status = stale ? 'Dead Zone' : classify(c.rssi);
-  const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
-  return { c, stale, status, cls: cls(status), q: quality(c.rssi),
-    aq: avg(l.hist.map(h => quality(h.rssi))), al: avg(l.hist.map(h => h.latency_ms).filter(v => v != null)),
-    note: stale ? `No heartbeat for ${Math.round(age)} s` : (c.rssi == null ? 'Not connected to Wi-Fi' : l.note) };
+function sorted() {
+  return [...state.locs.values()].sort((a, b) =>
+    (a.kind === 'live' ? 0 : 1) - (b.kind === 'live' ? 0 : 1) || a.name.localeCompare(b.name));
 }
+const idle = l => (Date.now() - l.lastChange) / 1000 > CONFIG.STALE_S;
 
 /* ---------- gauge ---------- */
 const A0 = 135, SW = 270;   // arc starts bottom-left and sweeps 270 degrees clockwise
@@ -176,9 +163,9 @@ function initCharts() {
     interaction: { mode: 'index', intersect: false }, plugins: { legend: { display: false } },
     scales: { x: { ticks: { maxTicksLimit: 6, maxRotation: 0 }, grid: { display: false } }, y } });
   const dash = col => ({ data: [], borderColor: col, borderDash: [6, 4], borderWidth: 1, pointRadius: 0 });
-  cs = new Chart($('#cs'), { type: 'line', options: opts({ min: 0, max: 100, title: { display: true, text: 'Wi-Fi strength (%)' } }),
+  cs = new Chart($('#cs'), { type: 'line', options: opts({ min: -100, max: -30, title: { display: true, text: 'Signal (dBm)' } }),
     data: { labels: [], datasets: [
-      { data: [], borderColor: '#2e8b57', backgroundColor: 'rgba(31,107,74,.8)', fill: true, pointRadius: 0, borderWidth: 1.5, tension: .3 },
+      { data: [], borderColor: '#2e8b57', backgroundColor: 'rgba(31,107,74,.5)', fill: 'start', pointRadius: 0, borderWidth: 1.5, tension: .3 },
       dash('#2fb24c'), dash('#e5252a')] } });
   cl = new Chart($('#cl'), { type: 'line', options: opts({ beginAtZero: true, title: { display: true, text: 'Latency (ms)' } }),
     data: { labels: [], datasets: [
@@ -186,11 +173,11 @@ function initCharts() {
 }
 function updateCharts(l) {
   if (!cs) return;
-  const h = l.hist, labels = h.map(p => clock(p.ts));
+  const h = l ? l.hist : [], labels = h.map(p => clock(p.timestamp));
   cs.data.labels = labels;
-  cs.data.datasets[0].data = h.map(p => quality(p.rssi));
-  cs.data.datasets[1].data = labels.map(() => 66);   // -67 dBm  (Good threshold)
-  cs.data.datasets[2].data = labels.map(() => 40);   // -80 dBm  (Dead zone threshold)
+  cs.data.datasets[0].data = h.map(p => p.rssi);
+  cs.data.datasets[1].data = labels.map(() => -67);   // Good threshold
+  cs.data.datasets[2].data = labels.map(() => -80);   // Dead Zone threshold
   cs.update('none');
   cl.data.labels = labels;
   cl.data.datasets[0].data = h.map(p => p.latency_ms);
@@ -199,52 +186,55 @@ function updateCharts(l) {
 
 /* ---------- render ---------- */
 function render() {
-  const vs = state.locs.map(view);
-  const dead = state.locs.filter((l, i) => vs[i].status === 'Dead Zone').map(l => l.name);
-  const a = $('#alert');
+  const list = sorted(), a = $('#alert');
+  if (!list.length) {
+    a.className = ''; a.textContent = state.err ? 'Cannot reach the backend' : 'Waiting for the first reading';
+    $('#locs').innerHTML = ''; $('#selName').textContent = ''; $('#selSub').textContent = '';
+    $('#gauge').innerHTML = gaugeSVG(0, 'none', '--'); $('#tiles').innerHTML = ''; updateCharts(null);
+    return;
+  }
+  const dead = list.filter(l => l.st.status === 'Dead Zone').map(l => l.name);
   a.className = dead.length ? 'bad' : '';
   a.textContent = dead.length ? 'Dead zone detected: ' + dead.join(', ') : 'No dead zones detected';
 
-  $('#locs').innerHTML = state.locs.map((l, i) => {
-    const v = vs[i], lat = v.empty || v.c.latency_ms == null ? '--' : Math.round(v.c.latency_ms);
-    return `<button class="loc ${v.cls}${i === state.sel ? ' sel' : ''}" data-i="${i}" aria-pressed="${i === state.sel}">
-      <span class="r1"><b>${esc(l.name)}</b><em class="tag ${l.kind}">${l.kind}</em></span>
-      <span class="st">${v.status}</span>
-      <span class="r3">${v.empty ? '--' : Math.round(v.q)}% <small>strength</small> &nbsp; ${lat} <small>ms</small></span></button>`;
+  $('#locs').innerHTML = list.map(l => {
+    const s = l.st, off = idle(l);
+    return `<button class="loc ${cls(s.status)}${l.name === state.sel ? ' sel' : ''}${off ? ' idle' : ''}" data-n="${esc(l.name)}" aria-pressed="${l.name === state.sel}">
+      <span class="r1"><b>${esc(l.name)}</b><em class="tag ${l.kind === 'live' && !off ? 'live' : ''}">${off ? 'no new data' : l.kind}</em></span>
+      <span class="st">${s.status}</span>
+      <span class="r3">${fmt(s.avg_rssi, 1)} <small>dBm</small> &nbsp; ${fmt(s.latency_ms)} <small>ms</small> &nbsp; ${fmt(s.packet_loss_pct)} <small>% loss</small></span></button>`;
   }).join('');
 
-  const l = state.locs[state.sel], v = vs[state.sel], c = v.c;
+  const l = state.locs.get(state.sel), s = l.st, c = l.hist[l.hist.length - 1], off = idle(l), k = cls(s.status);
   $('#selName').textContent = l.name;
-  $('#selSub').textContent = v.note || (v.empty ? '' : 'Last reading ' + clock(c.ts));
-  $('#gauge').innerHTML = gaugeSVG(v.empty ? 0 : v.q, v.cls, v.empty ? '--' : Math.round(v.q) + ' %');
-  const t = (k, val, st = '') => `<div class="tile"><div class="k">${k}</div><div class="v"${st}>${val}</div></div>`;
+  $('#selSub').textContent = (off ? 'No new readings for ' + Math.round((Date.now() - l.lastChange) / 1000) + ' s. Showing the last data. ' : '')
+    + (c ? 'Last reading ' + clock(c.timestamp) : '');
+  $('#gauge').innerHTML = gaugeSVG(quality(s.avg_rssi), k, Math.round(quality(s.avg_rssi)) + ' %');
+  const t = (name, val, st = '') => `<div class="tile"><div class="k">${name}</div><div class="v"${st}>${val}</div></div>`;
   $('#tiles').innerHTML = [
-    t('Signal level', v.empty || c.rssi == null ? '--' : c.rssi + ' dBm'),
-    t('Latency', v.empty ? '--' : c.latency_ms == null ? 'Timeout' : Math.round(c.latency_ms) + ' ms'),
-    t('Packet loss', v.empty || c.packet_loss_pct == null ? '--' : c.packet_loss_pct + ' %'),
-    t('Status', v.status, ` style="color:var(--${v.cls})"`),
-    t(`Avg strength (${WIN})`, v.aq == null ? '--' : Math.round(v.aq) + ' %'),
-    t(`Avg latency (${WIN})`, v.al == null ? '--' : Math.round(v.al) + ' ms')].join('');
+    t('Signal level', !c ? '--' : c.rssi + ' dBm'),
+    t('Latency', !c ? '--' : c.latency_ms == null ? 'Timeout' : Math.round(c.latency_ms) + ' ms'),
+    t('Packet loss', !c || c.packet_loss_pct == null ? '--' : c.packet_loss_pct + ' %'),
+    t('Status', s.status, ` style="color:var(--${k})"`),
+    t('Avg signal (last 5)', fmt(s.avg_rssi, 1) + ' dBm'),
+    t('Avg latency (last 5)', fmt(s.latency_ms) + ' ms')].join('');
   updateCharts(l);
 }
 function renderPill() {
-  const l = state.locs[0], v = view(l);
-  const [txt, c] = l.err ? ['Backend unreachable', 'dead'] : v.empty ? ['Waiting for Pi', 'weak']
-    : v.stale ? ['Pi offline', 'dead'] : ['Pi live', 'good'];
+  const list = sorted(), live = list.filter(l => !idle(l)).length;
+  const [txt, c] = state.err ? ['Backend unreachable', 'dead'] : !list.length ? ['Waiting for data', 'weak']
+    : live === 0 ? ['No sensors updating', 'dead'] : [live + ' of ' + list.length + ' sensors updating', 'good'];
   $('#pill').className = 'pill ' + c; $('#pill').textContent = txt;
   $('#upd').textContent = 'Updated ' + clock(Date.now()) + ' - refreshes every ' + CONFIG.REFRESH_MS / 1000 + ' s';
+  $('#msg').textContent = state.err ? 'Backend unreachable at ' + (CONFIG.API_BASE || location.origin) + '. Is backend/app.py running?' : '';
 }
 
-async function refresh() {
-  mockStep();
-  await pullReal(state.locs[0]);
-  render(); renderPill();
-}
+async function refresh() { await pull(); render(); renderPill(); }
 $('#locs').addEventListener('click', e => {
-  const b = e.target.closest('button[data-i]');
-  if (b) { state.sel = +b.dataset.i; render(); }
+  const b = e.target.closest('button[data-n]');
+  if (b) { state.sel = b.dataset.n; render(); }
 });
-seed(); initCharts(); render(); refresh();
+initCharts(); render(); refresh();
 setInterval(refresh, CONFIG.REFRESH_MS);
 </script>
 </body>

@@ -36,6 +36,9 @@ ap.add_argument("--iface", default=IFACE)
 ap.add_argument("--target", default="", help="host to ping (default: Wi-Fi gateway)")
 ap.add_argument("--duration", type=float, default=0, help="stop after this many seconds (0 = run until Ctrl+C)")
 ap.add_argument("--mock", action="store_true", help="generate random values, no Pi needed")
+ap.add_argument("--mock-rssi", type=float, default=None,
+                help="with --mock: hold the signal around this dBm (e.g. -50 Good, -72 Weak, -86 Dead Zone). "
+                     "Omit to let it drift through all three.")
 args = ap.parse_args()
 URL = args.server.rstrip("/") + "/api/readings"
  
@@ -78,7 +81,10 @@ def ping(host):
  
 def mock_values(t):
     """Fake signal that drifts Good -> Weak -> Dead Zone and back (about 2 min per cycle)."""
-    rssi = round(-73 + 17 * math.sin(t / 20) + random.uniform(-3, 3))
+    if args.mock_rssi is not None:   # fixed spot: small wobble around the chosen level
+        rssi = round(args.mock_rssi + 2 * math.sin(t / 15) + random.uniform(-3, 3))
+    else:                            # drifting spot
+        rssi = round(-73 + 17 * math.sin(t / 20) + random.uniform(-3, 3))
     bad = max(0.0, (-rssi - 67) / 25)
     return rssi, round(random.uniform(5, 20) + bad * random.uniform(30, 200), 1), \
         round(min(100.0, bad * random.uniform(0, 60)), 1)
@@ -123,4 +129,3 @@ try:
         time.sleep(max(0.0, args.interval - (time.monotonic() - t)))
 except KeyboardInterrupt:
     print("\nStopped.")
- 
