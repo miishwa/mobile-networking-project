@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wi-Fi Dead Zone Monitor</title>
+<style>
+:root{--bg:#121212;--nav:#0b0b0b;--panel:#1e1e1e;--tile:#272727;--line:#333;--ink:#f3f3f3;--mute:#9b9b9b;
+  --link:#2a9df4;--good:#2fb24c;--weak:#fdc82f;--dead:#e5252a;--none:#6b6b6b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums}
+.nav{background:var(--nav);border-bottom:1px solid var(--line);padding:12px 20px;display:flex;justify-content:space-between;align-items:center;gap:8px 16px;flex-wrap:wrap}
+.brand{font-size:18px;font-weight:600}
+.meta{display:flex;gap:14px;align-items:center;color:var(--mute);font-size:13px}
+.pill{padding:2px 12px;border-radius:99px;font-weight:600;border:1px solid var(--c);color:var(--c)}
+main{max-width:1240px;margin:0 auto;padding:16px}
+.good{--c:var(--good)}.weak{--c:var(--weak)}.dead{--c:var(--dead)}.none{--c:var(--none)}
+#alert{padding:10px 14px;border-radius:8px;margin-bottom:12px;font-weight:600;background:#14301c;border-left:5px solid var(--good)}
+#alert.bad{background:#3a1217;border-left-color:var(--dead)}
+.locs{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-bottom:12px}
+.loc{font:inherit;color:inherit;text-align:left;background:var(--panel);border:1px solid var(--line);border-top:4px solid var(--c);border-radius:10px;padding:10px 14px;cursor:pointer;display:flex;flex-direction:column;gap:2px}
+.loc.sel{outline:2px solid var(--link);outline-offset:1px}
+.loc:focus-visible{outline:2px solid var(--link)}
+.r1{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.tag{font-style:normal;font-size:12px;padding:0 8px;border-radius:99px;border:1px solid var(--mute);color:var(--mute)}
+.tag.live{border-color:var(--link);color:var(--link)}
+.st{font-weight:700;color:var(--c)}
+.r3 small{color:var(--mute)}
+.head{margin:16px 0 10px}
+.head h2{margin:0;font-size:18px;font-weight:600}
+.head div{color:var(--mute);font-size:13px;min-height:18px}
+.top{display:grid;grid-template-columns:minmax(300px,1.4fr) repeat(3,1fr);grid-template-rows:repeat(2,minmax(120px,auto));gap:12px;margin-bottom:12px}
+.panel{background:var(--panel);border-radius:10px;padding:14px 16px;margin-bottom:12px}
+.gauge{grid-row:span 2;margin:0;display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap}
+.gauge svg{width:230px;max-width:100%}
+.gv{font-size:34px;font-weight:600;fill:var(--ink)}.gs{font-size:11px;fill:var(--mute)}
+.legend{font-size:12px;display:flex;flex-direction:column;gap:6px;color:var(--ink)}
+.legend span{display:flex;align-items:center;gap:6px}
+.legend i{width:10px;height:10px;border-radius:50%;border:2px solid var(--c)}
+#tiles{display:contents}
+.tile{background:var(--tile);border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:10px}
+.tile .k{color:var(--ink);font-size:14px;margin-bottom:6px}
+.tile .v{font-size:28px;font-weight:500}
+.panel h3{margin:0 0 8px;font-size:15px;font-weight:600}
+.cb{position:relative;height:230px}
+#msg{color:var(--dead);font-size:13px}
+@media(max-width:900px){.top{grid-template-columns:1fr 1fr}.gauge{grid-column:span 2;grid-row:auto}}
+</style>
+</head>
+<body>
+<header class="nav">
+  <div class="brand">Wi-Fi dead zone monitor</div>
+  <div class="meta"><span id="pill" class="pill none">Starting</span><span id="upd"></span></div>
+</header>
+<main>
+  <div id="alert" role="status" aria-live="polite">Checking sensors</div>
+  <section class="locs" id="locs" aria-label="Locations"></section>
+
+  <div class="head"><h2 id="selName"></h2><div id="selSub"></div></div>
+  <section class="top">
+    <div class="panel gauge">
+      <div id="gauge"></div>
+      <div class="legend">
+        <span class="good"><i></i>Good: above -67 dBm</span>
+        <span class="weak"><i></i>Weak: -67 to -80 dBm</span>
+        <span class="dead"><i></i>Dead zone: below -80 dBm</span>
+      </div>
+    </div>
+    <div id="tiles"></div>
+  </section>
+
+  <section class="panel"><h3>Wi-Fi strength over time</h3><div class="cb"><canvas id="cs" role="img" aria-label="Wi-Fi strength over time"></canvas></div></section>
+  <section class="panel"><h3>Latency over time</h3><div class="cb"><canvas id="cl" role="img" aria-label="Latency over time"></canvas></div></section>
+  <div id="msg"></div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+/* Location 0 is LIVE (read from the Flask backend, fed by the Raspberry Pi). Locations 1-3 are MOCK.
+   REAL_LOCATION must match the LOCATION used by sensor.py. If you open this file directly instead of
+   via Flask, set API_BASE to the backend address (e.g. 'http://192.168.1.50:5000'). */
+const CONFIG = {
+  API_BASE: location.protocol === 'file:' ? 'http://localhost:5000' : '',
+  REAL_LOCATION: 'Pi Sensor', REFRESH_MS: 5000, POINTS: 60, STALE_S: 30
+};
+const WIN = Math.round(CONFIG.POINTS * CONFIG.REFRESH_MS / 60000) + ' min';
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const clock = d => new Date(d).toLocaleTimeString([], { hour12: false });
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const quality = r => r == null ? 0 : clamp(2 * (r + 100), 0, 100);   // common linear dBm -> % mapping (-50 dBm = 100 %, -100 dBm = 0 %)
+const classify = r => r == null ? 'Dead Zone' : r > -67 ? 'Good' : r >= -80 ? 'Weak' : 'Dead Zone';
+const cls = s => s === 'Good' ? 'good' : s === 'Weak' ? 'weak' : s === 'Dead Zone' ? 'dead' : 'none';
+
+const state = { sel: 0, locs: [
+  { name: CONFIG.REAL_LOCATION, kind: 'live', hist: [], note: 'Waiting for the Pi to send data' },
+  { name: 'Near Router', kind: 'mock', m: { base: -52, amp: 4, per: 3.5, ph: 0.0, lat: 6 },  hist: [] },
+  { name: 'Hallway',     kind: 'mock', m: { base: -73, amp: 8, per: 4.5, ph: 1.2, lat: 9 },  hist: [] },
+  { name: 'Stairwell',   kind: 'mock', m: { base: -86, amp: 8, per: 5.5, ph: 2.4, lat: 12 }, hist: [] }
+] };
+
+/* ---------- mock data (same shape as /api/readings) ---------- */
+let tick = 0;
+function mockPoint(m, t, ts) {
+  const rssi = Math.round(m.base + m.amp * Math.sin(t / m.per + m.ph) + (Math.random() - .5) * 3);
+  const below = Math.max(0, -67 - rssi);
+  return { ts: new Date(ts).toISOString(), rssi,
+    latency_ms: Math.round(m.lat + below * below * 0.12 + Math.random() * 4),
+    packet_loss_pct: rssi > -67 ? +(Math.random() * 0.4).toFixed(1) : +Math.min(60, below + Math.random() * 2).toFixed(1) };
+}
+const mocks = () => state.locs.filter(l => l.kind === 'mock');
+function seed() {
+  const now = Date.now();
+  mocks().forEach(l => { for (let i = 0; i < CONFIG.POINTS; i++) {
+    const back = CONFIG.POINTS - 1 - i; l.hist.push(mockPoint(l.m, -back, now - back * CONFIG.REFRESH_MS)); } });
+}
+function mockStep() {
+  tick++;
+  mocks().forEach(l => { l.hist.push(mockPoint(l.m, tick, Date.now())); if (l.hist.length > CONFIG.POINTS) l.hist.shift(); });
+}
+
+/* ---------- real data from the backend ---------- */
+async function pullReal(l) {
+  try {
+    const sr = await fetch(CONFIG.API_BASE + '/api/status');
+    if (!sr.ok) throw new Error('status ' + sr.status);
+    const s = await sr.json();
+    if (!(s.locations || []).some(x => x.location === l.name)) {
+      l.hist = []; l.err = false; l.note = 'Waiting for the Pi to send its first reading'; return;
+    }
+    const rr = await fetch(`${CONFIG.API_BASE}/api/readings?location=${encodeURIComponent(l.name)}&limit=${CONFIG.POINTS}`);
+    if (!rr.ok) throw new Error('readings ' + rr.status);
+    l.hist = (await rr.json()).readings || []; l.err = false; l.note = '';
+  } catch (e) {
+    l.err = true; l.note = 'Backend unreachable. Is app.py running?';
+  }
+}
+
+/* ---------- derived view of one location ---------- */
+function view(l) {
+  const c = l.hist.at(-1);
+  if (!c) return { empty: true, status: 'No data', cls: 'none', note: l.note };
+  const age = (Date.now() - Date.parse(c.ts)) / 1000;
+  const stale = l.kind === 'live' && age > CONFIG.STALE_S;
+  const status = stale ? 'Dead Zone' : classify(c.rssi);
+  const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
+  return { c, stale, status, cls: cls(status), q: quality(c.rssi),
+    aq: avg(l.hist.map(h => quality(h.rssi))), al: avg(l.hist.map(h => h.latency_ms).filter(v => v != null)),
+    note: stale ? `No heartbeat for ${Math.round(age)} s` : (c.rssi == null ? 'Not connected to Wi-Fi' : l.note) };
+}
+
+/* ---------- gauge ---------- */
+const A0 = 135, SW = 270;   // arc starts bottom-left and sweeps 270 degrees clockwise
+function arc(cx, cy, r, a0, a1) {
+  const p = a => [cx + r * Math.cos(a * Math.PI / 180), cy + r * Math.sin(a * Math.PI / 180)];
+  const [x0, y0] = p(a0), [x1, y1] = p(a1);
+  return `M${x0.toFixed(1)} ${y0.toFixed(1)}A${r} ${r} 0 ${a1 - a0 > 180 ? 1 : 0} 1 ${x1.toFixed(1)} ${y1.toFixed(1)}`;
+}
+function gaugeSVG(q, c, label) {
+  const ang = p => A0 + SW * p / 100, cx = 110, cy = 108;
+  const rim = [[0,25,'#e5252a'],[25,40,'#f26522'],[40,66,'#fdc82f'],[66,83,'#a8c72a'],[83,100,'#2fb24c']]
+    .map(([a, b, col]) => `<path d="${arc(cx, cy, 92, ang(a) + 1, ang(b) - 1)}" stroke="${col}" stroke-width="5" fill="none"/>`).join('');
+  const fill = q > 0.5 ? `<path d="${arc(cx, cy, 70, A0, ang(q))}" style="stroke:var(--${c})" stroke-width="22" fill="none"/>` : '';
+  return `<svg viewBox="0 0 220 200" role="img" aria-label="Wi-Fi strength ${label}">
+    <path d="${arc(cx, cy, 70, A0, A0 + SW)}" stroke="#2c2c2c" stroke-width="22" fill="none"/>${fill}${rim}
+    <text x="110" y="114" text-anchor="middle" class="gv">${label}</text>
+    <text x="110" y="134" text-anchor="middle" class="gs">Wi-Fi strength</text></svg>`;
+}
+
+/* ---------- charts ---------- */
+let cs, cl;
+function initCharts() {
+  if (typeof Chart === 'undefined') { $('#msg').textContent = 'Chart.js did not load. Check the internet connection or host the library locally.'; return; }
+  Chart.defaults.color = '#9b9b9b'; Chart.defaults.borderColor = '#2e2e2e';
+  const opts = y => ({ responsive: true, maintainAspectRatio: false, animation: false,
+    interaction: { mode: 'index', intersect: false }, plugins: { legend: { display: false } },
+    scales: { x: { ticks: { maxTicksLimit: 6, maxRotation: 0 }, grid: { display: false } }, y } });
+  const dash = col => ({ data: [], borderColor: col, borderDash: [6, 4], borderWidth: 1, pointRadius: 0 });
+  cs = new Chart($('#cs'), { type: 'line', options: opts({ min: 0, max: 100, title: { display: true, text: 'Wi-Fi strength (%)' } }),
+    data: { labels: [], datasets: [
+      { data: [], borderColor: '#2e8b57', backgroundColor: 'rgba(31,107,74,.8)', fill: true, pointRadius: 0, borderWidth: 1.5, tension: .3 },
+      dash('#2fb24c'), dash('#e5252a')] } });
+  cl = new Chart($('#cl'), { type: 'line', options: opts({ beginAtZero: true, title: { display: true, text: 'Latency (ms)' } }),
+    data: { labels: [], datasets: [
+      { data: [], borderColor: '#2a9df4', backgroundColor: 'rgba(42,157,244,.2)', fill: true, pointRadius: 0, borderWidth: 1.5, tension: .3, spanGaps: false }] } });
+}
+function updateCharts(l) {
+  if (!cs) return;
+  const h = l.hist, labels = h.map(p => clock(p.ts));
+  cs.data.labels = labels;
+  cs.data.datasets[0].data = h.map(p => quality(p.rssi));
+  cs.data.datasets[1].data = labels.map(() => 66);   // -67 dBm  (Good threshold)
+  cs.data.datasets[2].data = labels.map(() => 40);   // -80 dBm  (Dead zone threshold)
+  cs.update('none');
+  cl.data.labels = labels;
+  cl.data.datasets[0].data = h.map(p => p.latency_ms);
+  cl.update('none');
+}
+
+/* ---------- render ---------- */
+function render() {
+  const vs = state.locs.map(view);
+  const dead = state.locs.filter((l, i) => vs[i].status === 'Dead Zone').map(l => l.name);
+  const a = $('#alert');
+  a.className = dead.length ? 'bad' : '';
+  a.textContent = dead.length ? 'Dead zone detected: ' + dead.join(', ') : 'No dead zones detected';
+
+  $('#locs').innerHTML = state.locs.map((l, i) => {
+    const v = vs[i], lat = v.empty || v.c.latency_ms == null ? '--' : Math.round(v.c.latency_ms);
+    return `<button class="loc ${v.cls}${i === state.sel ? ' sel' : ''}" data-i="${i}" aria-pressed="${i === state.sel}">
+      <span class="r1"><b>${esc(l.name)}</b><em class="tag ${l.kind}">${l.kind}</em></span>
+      <span class="st">${v.status}</span>
+      <span class="r3">${v.empty ? '--' : Math.round(v.q)}% <small>strength</small> &nbsp; ${lat} <small>ms</small></span></button>`;
+  }).join('');
+
+  const l = state.locs[state.sel], v = vs[state.sel], c = v.c;
+  $('#selName').textContent = l.name;
+  $('#selSub').textContent = v.note || (v.empty ? '' : 'Last reading ' + clock(c.ts));
+  $('#gauge').innerHTML = gaugeSVG(v.empty ? 0 : v.q, v.cls, v.empty ? '--' : Math.round(v.q) + ' %');
+  const t = (k, val, st = '') => `<div class="tile"><div class="k">${k}</div><div class="v"${st}>${val}</div></div>`;
+  $('#tiles').innerHTML = [
+    t('Signal level', v.empty || c.rssi == null ? '--' : c.rssi + ' dBm'),
+    t('Latency', v.empty ? '--' : c.latency_ms == null ? 'Timeout' : Math.round(c.latency_ms) + ' ms'),
+    t('Packet loss', v.empty || c.packet_loss_pct == null ? '--' : c.packet_loss_pct + ' %'),
+    t('Status', v.status, ` style="color:var(--${v.cls})"`),
+    t(`Avg strength (${WIN})`, v.aq == null ? '--' : Math.round(v.aq) + ' %'),
+    t(`Avg latency (${WIN})`, v.al == null ? '--' : Math.round(v.al) + ' ms')].join('');
+  updateCharts(l);
+}
+function renderPill() {
+  const l = state.locs[0], v = view(l);
+  const [txt, c] = l.err ? ['Backend unreachable', 'dead'] : v.empty ? ['Waiting for Pi', 'weak']
+    : v.stale ? ['Pi offline', 'dead'] : ['Pi live', 'good'];
+  $('#pill').className = 'pill ' + c; $('#pill').textContent = txt;
+  $('#upd').textContent = 'Updated ' + clock(Date.now()) + ' - refreshes every ' + CONFIG.REFRESH_MS / 1000 + ' s';
+}
+
+async function refresh() {
+  mockStep();
+  await pullReal(state.locs[0]);
+  render(); renderPill();
+}
+$('#locs').addEventListener('click', e => {
+  const b = e.target.closest('button[data-i]');
+  if (b) { state.sel = +b.dataset.i; render(); }
+});
+seed(); initCharts(); render(); refresh();
+setInterval(refresh, CONFIG.REFRESH_MS);
+</script>
+</body>
+</html>
